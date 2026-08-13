@@ -15,10 +15,13 @@ service (`ctx.gitbash`) that runs Git Bash — it does **not** displace
   POSIX bash tool: `bash -c` execution, terminal-card presentation, `[exit
   code: N]` markers, `run_in_background` jobs, and the same environment
   overrides (`TERM=dumb`, `PAGER=cat`, …).
-- Automatic Git Bash discovery: `C:\Program Files\Git\bin\bash.exe`,
-  `C:\Program Files (x86)\Git\bin\bash.exe`,
-  `%LOCALAPPDATA%\Programs\Git\bin\bash.exe`, then Git-owned PATH entries.
-  Pin it with `bashPath` in the `gitbash-executor` row config if needed.
+- Automatic Git Bash discovery, in preference order:
+  1. `bashPath` config / settings value (pinned),
+  2. well-known installs — each root's `bin\bash.exe` then `usr\bin\bash.exe`:
+     `C:\Program Files\Git`, `C:\Program Files (x86)\Git`,
+     `%LOCALAPPDATA%\Programs\Git`, `~/scoop/apps/git/current` (Scoop),
+  3. Git-owned PATH entries.
+  When nothing is found, the error lists every probed candidate path.
 - The Git runtime dirs (`bin`, `usr\bin`, `mingw64\bin`) are prepended to
   each child's PATH, so `grep`, `sed`, `git`, … resolve inside bash.
 
@@ -41,15 +44,31 @@ file-sandboxed shell on Windows, keep using the `pwsh` tool.
 
 ```sh
 # requires pnpm on PATH
-dsh plugin --profile web add file:./dsh-gitbash    # from the plugin's parent dir
-# or from the registry once published:
-# dsh plugin --profile web add dsh-gitbash
+# from a local checkout (live-linked; edits take effect without re-installing):
+dsh plugin --profile web add link:./dsh-gitbash
+# from a copy (self-contained; re-run `add` after editing sources):
+# dsh plugin --profile web add file:./dsh-gitbash
+# from GitHub:
+# dsh plugin --profile web add https://github.com/GrounzerLiu/dsh-gitbash.git
 ```
 
 Then **restart the dsh web process** (bundle layers are read at boot) and
-reload the browser page. After editing the plugin sources, re-run the `add`
-(or `dsh plugin --profile web remove dsh-gitbash` + `add`) to refresh the
-installed copy, then restart again.
+reload the browser page.
+
+### Development loop
+
+For `link:` installs the profile's `node_modules/dsh-gitbash` is a symlink to
+the checkout. The checkout itself needs its dependencies resolvable: create a
+junction from the checkout's `node_modules` to the profile fallback directory
+(`$DSH_HOME/profiles/node_modules`, which links every `@deepseek-ai/*`
+package of the installation), or run `pnpm install` inside the checkout.
+After editing sources, only the dsh web restart is needed — no re-install.
+
+## Tests
+
+```sh
+node --test   # pure-function tests + real-spawn smoke tests (skip when no Git Bash detected)
+```
 
 ## What the patch does
 
@@ -69,7 +88,16 @@ dsh plugin --profile web remove dsh-gitbash
 
 ## Config
 
-`gitbash-executor` row `config` (all optional):
+The executor registers a `gitbash` settings section, so `$DSH_HOME/settings.yaml`
+can tune it without touching the profile patch:
+
+```yaml
+gitbash:
+  bashPath: 'C:\Program Files\Git\bin\bash.exe'   # optional pin
+  timeoutMs: 120000
+```
+
+`gitbash-executor` row `config` (all optional; the settings section overrides):
 
 | key | default | meaning |
 | --- | --- | --- |
@@ -98,3 +126,6 @@ dsh plugin --profile web remove dsh-gitbash
   it always uses the detected/pinned Git Bash path.
 - The persistent PTY terminal feature (`ctx.terminals`) is preset-plane and
   out of scope for this bundle.
+- Other profiles work unchanged: the rows are host-plane and win32-gated, so
+  the same plugin also serves `--profile headless`
+  (`dsh plugin --profile headless add link:./dsh-gitbash`).

@@ -1,0 +1,32 @@
+# dsh-gitbash bundle patch — applied after the dsh-base and dsh-web-app
+# layers of the profile composition.
+#
+# Mounts the Git Bash executor and the model-facing `bash` tool on Windows
+# (Git for Windows). Both rows stay inert on POSIX, where the shipped
+# bash-sandbox / tool-bash pair already owns the platform shell; on win32 the
+# shipped bash tool is disabled by design, so this layer is the only provider
+# of the `bash` tool name.
+#
+# The `pwsh` tool is untouched: this plugin registers a sibling service
+# (`ctx.gitbash`) instead of displacing `ctx.shell`, so both tools coexist.
+# NOTE: the git bash executor is intentionally NOT sandboxed — the
+# windows-acl restricted token breaks the msys2 runtime (signal-pipe
+# creation fails), so `sandboxMode` is undefined and bash commands run with
+# full file access (see README.md).
+- insert:
+    - id: gitbash-executor
+      name: 'dsh-gitbash'
+      disabled: !!js process.platform !== 'win32'
+      config:
+        # Optional: pin the Git Bash executable. Auto-detected otherwise
+        # (well-known Git for Windows install roots, then Git-owned PATH
+        # entries). Example:
+        #   bashPath: 'C:\Program Files\Git\bin\bash.exe'
+        timeoutMs: 120000
+        maxTimeoutMs: 600000
+
+    - id: tool-gitbash
+      name: 'dsh-gitbash/tool'
+      disabled: !!js process.platform !== 'win32'
+      config:
+        enableRunInBackground: true

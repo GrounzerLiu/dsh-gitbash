@@ -1,0 +1,23 @@
+{
+  "name": "dsh-gitbash",
+  "version": "0.1.0",
+  "description": "DSH profile plugin: run the model-facing bash tool on Git for Windows (Git Bash), with the same windows-acl sandboxing as the pwsh tool.",
+  "type": "module",
+  "main": "lib/executor.js",
+  "exports": {
+    ".": "./lib/executor.js",
+    "./tool": "./lib/tool.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "patch.yml",
+    "README.md"
+  ],
+  "license": "MIT",
+  "dsh": {
+    "bundle": {
+      "patch": "./patch.yml"
+    }
+  }
+}

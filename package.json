@@ -1,7 +1,7 @@
 {
   "name": "dsh-gitbash",
-  "version": "0.1.0",
-  "description": "DSH profile plugin: run the model-facing bash tool on Git for Windows (Git Bash), with the same windows-acl sandboxing as the pwsh tool.",
+  "version": "0.2.0",
+  "description": "DSH profile plugin: run the model-facing bash tool on Git for Windows (Git Bash). NOT file-sandboxed — the msys2 runtime cannot run under the Windows restricted-token sandbox, so commands run with the harness process's full file access (see README).",
   "type": "module",
   "main": "lib/executor.js",
   "exports": {
@@ -16,6 +16,19 @@
   ],
   "scripts": {
     "test": "node --test"
+  },
+  "dependencies": {
+    "@deepseek-ai/cordis": "4.0.1",
+    "@deepseek-ai/dsh-llm": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-sandbox": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-settings": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-shell": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-timeout": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-tools": "0.1.0-rc.6",
+    "@deepseek-ai/schemastery": "3.18.1"
+  },
+  "engines": {
+    "node": ">=20"
   },
   "license": "MIT",
   "dsh": {

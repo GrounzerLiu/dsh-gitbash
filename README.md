@@ -24,6 +24,18 @@ service (`ctx.gitbash`) that runs Git Bash — it does **not** displace
   When nothing is found, the error lists every probed candidate path.
 - The Git runtime dirs (`bin`, `usr\bin`, `mingw64\bin`) are prepended to
   each child's PATH, so `grep`, `sed`, `git`, … resolve inside bash.
+- MSYS path compatibility: `workdir` values in Git Bash style (`/d/foo`,
+  `~/foo`) are converted to Windows paths automatically, and a workdir that
+  does not exist fails with a clear error instead of a cryptic spawn ENOENT.
+  A pinned `bashPath` is validated the same way (and may itself be given in
+  MSYS form).
+- A coherent shell environment: children get `SHELL` (the resolved
+  `bash.exe`) and `HOME` (from `USERPROFILE` when unset), so scripts and
+  tools that read them behave like a normal Git Bash terminal. Caller-supplied
+  env entries always win.
+- Background jobs distinguish *never started* from *terminated*: a spawn
+  failure settles the job as `failed` with the underlying error, instead of
+  being reported as `killed`.
 
 ## ⚠️ No file sandbox (important tradeoff)
 
@@ -52,6 +64,12 @@ dsh plugin --profile web add link:./dsh-gitbash
 # dsh plugin --profile web add https://github.com/GrounzerLiu/dsh-gitbash.git
 ```
 
+> The bundle imports `@deepseek-ai/*` packages and declares them in
+> `dependencies` pinned to the harness versions it was built against, so a
+> checkout resolves on its own (`pnpm install`) and on CI. At runtime the
+> harness's own copies always win: `link:` installs resolve through the
+> profile's `node_modules`, and `file:`/GitHub installs are hoisted into it.
+
 Then **restart the dsh web process** (bundle layers are read at boot) and
 reload the browser page.
 
@@ -67,8 +85,12 @@ After editing sources, only the dsh web restart is needed — no re-install.
 ## Tests
 
 ```sh
-node --test   # pure-function tests + real-spawn smoke tests (skip when no Git Bash detected)
+node --test   # pure-function tests + mock-subprocess executor tests + real-spawn smoke tests (smoke tests skip when no Git Bash detected)
 ```
+
+The executor's resolve/spawn/run/start paths are exercised with a mocked
+`subprocess` service, so they run on any platform; only the two real-spawn
+smoke tests require a Git Bash installation (win32).
 
 ## What the patch does
 

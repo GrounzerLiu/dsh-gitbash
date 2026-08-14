@@ -109,11 +109,14 @@ test("gitBashCandidates covers well-known roots and both entry points", () => {
 		USERPROFILE: "C:\\Users\\me"
 	};
 	const candidates = gitBashCandidates(env);
-	assert.ok(candidates.includes("C:\\Program Files\\Git\\bin\\bash.exe"));
-	assert.ok(candidates.includes("C:\\Program Files\\Git\\usr\\bin\\bash.exe"));
-	assert.ok(candidates.includes("C:\\Program Files (x86)\\Git\\bin\\bash.exe"));
-	assert.ok(candidates.includes("C:\\Users\\me\\AppData\\Local\\Programs\\Git\\bin\\bash.exe"));
-	assert.ok(candidates.includes("C:\\Users\\me\\scoop\\apps\\git\\current\\bin\\bash.exe"));
+	// Build expectations with the same `join` the implementation uses, so the
+	// test is platform-neutral (win32 backslashes on Windows, POSIX separators
+	// elsewhere) while still pinning the root/entry structure.
+	assert.ok(candidates.includes(join("C:\\Program Files", "Git", "bin", "bash.exe")));
+	assert.ok(candidates.includes(join("C:\\Program Files", "Git", "usr", "bin", "bash.exe")));
+	assert.ok(candidates.includes(join("C:\\Program Files (x86)", "Git", "bin", "bash.exe")));
+	assert.ok(candidates.includes(join("C:\\Users\\me\\AppData\\Local", "Programs", "Git", "bin", "bash.exe")));
+	assert.ok(candidates.includes(join("C:\\Users\\me", "scoop", "apps", "git", "current", "bin", "bash.exe")));
 });
 
 test("msysToWindows: converts MSYS paths and passes everything else through", () => {

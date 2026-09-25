@@ -30,3 +30,8 @@
       disabled: !!js process.platform !== 'win32'
       config:
         enableRunInBackground: true
+        # On `timeoutMs` expiry a foreground command moves to the background as
+        # a job (returning its id) instead of being killed — the same behavior
+        # the shipped `@deepseek-ai/dsh-tool-bash` has on POSIX. Set false to
+        # keep the old kill-on-expiry behavior.
+        promoteOnTimeout: true

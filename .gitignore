@@ -1,3 +1,11 @@
 node_modules/
 *.log
 .DS_Store
+
+# Install artifacts. The repository deliberately ships no lockfile: CI
+# resolves fresh on every run (pnpm 9, see .github/workflows/test.yml), and
+# pnpm-workspace.yaml carries a LOCAL-only allowBuilds policy for pnpm 10+
+# checkouts (CI's pnpm 9 has no such concept and does not need it).
+pnpm-lock.yaml
+pnpm-workspace.yaml
+package-lock.json

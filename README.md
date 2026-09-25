@@ -13,10 +13,25 @@ service (`ctx.gitbash`) that runs Git Bash — it does **not** displace
 
 - A model-facing tool literally named `bash`, with the same contract as the
   POSIX bash tool: `bash -c` execution, terminal-card presentation, `[exit
-  code: N]` markers, `run_in_background` jobs, and the same environment
-  overrides (`TERM=dumb`, `PAGER=cat`, …).
+  code: N]` markers, `run_in_background` jobs, promotion on timeout, and the
+  same environment overrides (`TERM=dumb`, `PAGER=cat`, …).
+- **Background jobs deliver output.** The job spec declares non-consuming pull
+  sources over the process's stdout/stderr, which the `ctx.jobs` registry
+  pumps into its per-job ring; `job_output` reads that ring. This mirrors the
+  shipped `@deepseek-ai/dsh-tool-bash` exactly — see the note on the
+  zero-output bug below.
+- **Promotion on timeout** (`promoteOnTimeout`, default `true`): a foreground
+  command that outlives its `timeoutMs` is *not* killed. The call stops
+  waiting and returns the job id, and the command keeps running in the
+  background:
+  ```
+  [still running after 120000ms; moved to background job bash-3]
+  The command keeps running in the background. You will be notified when it finishes;
+  read newer output with job_output, stop it with job_kill.
+  ```
+  Set `promoteOnTimeout: false` for the old kill-on-expiry behavior.
 - Automatic Git Bash discovery, in preference order:
-  1. `bashPath` config / settings value (pinned),
+  1. `bashPath` config value (pinned),
   2. well-known installs — each root's `bin\bash.exe` then `usr\bin\bash.exe`:
      `C:\Program Files\Git`, `C:\Program Files (x86)\Git`,
      `%LOCALAPPDATA%\Programs\Git`, `~/scoop/apps/git/current` (Scoop),
@@ -33,9 +48,35 @@ service (`ctx.gitbash`) that runs Git Bash — it does **not** displace
   `bash.exe`) and `HOME` (from `USERPROFILE` when unset), so scripts and
   tools that read them behave like a normal Git Bash terminal. Caller-supplied
   env entries always win.
-- Background jobs distinguish *never started* from *terminated*: a spawn
-  failure settles the job as `failed` with the underlying error, instead of
-  being reported as `killed`.
+
+## Relationship to the shipped tool (read this before editing)
+
+`lib/tool.js` and `lib/executor.js` are **ports** of the shipped
+`@deepseek-ai/dsh-tool-bash` and `@deepseek-ai/dsh-bash-local` from DSH
+`0.1.7-rc.2`, not independent implementations. Only two axes differ:
+
+1. the service is `ctx.gitbash` instead of `ctx.shell` (on win32 `ctx.shell`
+   belongs to pwsh, and the shipped POSIX bash pair is disabled);
+2. the backend spawns Git for Windows' `bash.exe` instead of `bash` on PATH,
+   which is where the Windows-specific discovery/PATH/workdir logic lives.
+
+`GitBashExecutor` deliberately extends `Service` directly rather than
+`ShellExecutor`: that base class hardcodes `super(ctx, "shell")`, so extending
+it would collide with the pwsh executor instead of registering a sibling.
+
+When the shipped tool changes, **diff against it**; do not re-derive the
+implementation. Two drift incidents came from hand-maintaining a copy:
+
+- **`owner` type.** The registry resolves `spec.owner` through
+  `agents.get(session)`, i.e. a session **id** string. Passing the `Agent`
+  object made every `run_in_background` call throw
+  `session "[object Object]" has no live agent`.
+- **Output pull sources.** `spec.output` replaced the old `readOutput()` job
+  hook. Keeping the hook meant the registry had nothing to pump, so background
+  jobs finished with the correct exit code but read as **permanently empty**.
+
+Both are covered by `test/integration.test.mjs`, which runs against the real
+`dsh-jobs-local` registry rather than a stub.
 
 ## ⚠️ No file sandbox (important tradeoff)
 
@@ -65,10 +106,16 @@ dsh plugin --profile web add link:./dsh-gitbash
 ```
 
 > The bundle imports `@deepseek-ai/*` packages and declares them in
-> `dependencies` pinned to the harness versions it was built against, so a
-> checkout resolves on its own (`pnpm install`) and on CI. At runtime the
-> harness's own copies always win: `link:` installs resolve through the
-> profile's `node_modules`, and `file:`/GitHub installs are hoisted into it.
+> `peerDependencies`/`devDependencies` at the harness versions it was built
+> against. Peer ranges are pinned exactly (`0.1.7-rc.2`), so the harness
+> compatibility check has nothing to complain about, and `pnpm install` in a
+> checkout gives you the matching seam definitions for editing.
+>
+> A `link:` install resolves `@deepseek-ai/*` from the checkout's own
+> `node_modules`, which is why they must be installed there rather than
+> assumed from the host. The host's copies are separate module instances; the
+> service objects you pass in come from the host either way, so the two only
+> need to agree on shapes.
 
 Then **restart the dsh web process** (bundle layers are read at boot) and
 reload the browser page.
@@ -85,12 +132,24 @@ After editing sources, only the dsh web restart is needed — no re-install.
 ## Tests
 
 ```sh
-node --test   # pure-function tests + mock-subprocess executor tests + real-spawn smoke tests (smoke tests skip when no Git Bash detected)
+node --test
 ```
 
-The executor's resolve/spawn/run/start paths are exercised with a mocked
-`subprocess` service, so they run on any platform; only the two real-spawn
-smoke tests require a Git Bash installation (win32).
+Three layers:
+
+- **pure functions** — Git Bash discovery, MSYS path conversion, PATH entries.
+- **executor + tool against mock services** — the `resolve`/`execute`/
+  `result`/`observed` lifecycle, deadline classification, kill semantics,
+  the job registration shape, and the promotion path.
+- **integration against the real runtime** (`test/integration.test.mjs`) —
+  boots a real Cordis context with `dsh-jobs-local`, `dsh-subprocess-local`,
+  and `dsh-tool-jobs`, then asserts that a background job's stdout/stderr
+  actually land in the registry ring and that an `Agent`-typed owner is
+  rejected. This is the layer that catches drift in the seam contract; the
+  mock layer alone cannot.
+
+Everything except the real-spawn tests runs on any platform. Tests that need
+a Git Bash installation skip themselves when none is detected.
 
 ## What the patch does
 
@@ -110,16 +169,11 @@ dsh plugin --profile web remove dsh-gitbash
 
 ## Config
 
-The executor registers a `gitbash` settings section, so `$DSH_HOME/settings.yaml`
-can tune it without touching the profile patch:
-
-```yaml
-gitbash:
-  bashPath: 'C:\Program Files\Git\bin\bash.exe'   # optional pin
-  timeoutMs: 120000
-```
-
-`gitbash-executor` row `config` (all optional; the settings section overrides):
+All executor config lives in the `gitbash-executor` row of `patch.yml`
+(`$DSH_HOME/profiles/<profile>/cordis.patch.yml`), not in
+`$DSH_HOME/settings.yaml`: DSH 0.1.7 reworked the settings API
+(`ctx.settings.installSection` is gone), so this bundle declares its `Config`
+schema and lets the host project the form.
 
 | key | default | meaning |
 | --- | --- | --- |
@@ -136,6 +190,7 @@ gitbash:
 | key | default | meaning |
 | --- | --- | --- |
 | `enableRunInBackground` | `true` | expose `run_in_background` |
+| `promoteOnTimeout` | `true` | on `timeoutMs` expiry, move the command to the background as a job instead of killing it |
 
 ## Notes
 

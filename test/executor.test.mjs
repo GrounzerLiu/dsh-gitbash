@@ -3,12 +3,14 @@
  *
  * Pure functions (`findGitBash`, `gitBashCandidates`, `gitPathEntries`,
  * `msysToWindows`) are tested against throwaway directory trees. The
- * executor's resolve/spawn/run/start logic is exercised with a mock
+ * executor's resolve/spawn/execute lifecycle is exercised with a mock
  * `subprocess` service, so those tests run on any platform without a Git
- * Bash installation. The real-spawn smoke tests run only when a Git Bash
- * installation is actually detected (win32).
+ * Bash installation. The model-facing tool is mounted on a mock cordis
+ * context to cover the job/background and promote-on-timeout paths.
+ * The real-spawn smoke tests run only when a Git Bash installation is
+ * actually detected (win32).
  *
- * Run: `node --test test/`
+ * Run: `node --test`
  *
  * @module dsh-gitbash/test
  */
@@ -95,6 +97,8 @@ test("module shapes", () => {
 	assert.equal(typeof GitBashExecutor, "function");
 	assert.deepEqual(GitBashExecutor.inject, ["subprocess"]);
 	assert.ok(GitBashExecutor.Config, "executor exposes a Config schema");
+	// The service name must stay a sibling of `ctx.shell`: on win32 pwsh owns
+	// `ctx.shell`, and claiming it would displace the pwsh tool.
 	assert.equal(tool.name, "tool-gitbash");
 	assert.deepEqual(tool.inject, ["tools", "gitbash", "systemPrompt", "shellEnv"]);
 	assert.equal(typeof tool.apply, "function");
@@ -212,11 +216,14 @@ test("gitPathEntries keeps only existing Git runtime dirs", () => {
 	}
 });
 
-test("resolve: clamps timeoutMs to maxTimeoutMs", () => {
+test("resolve: clamps timeoutMs to maxTimeoutMs and fills onExpiry", () => {
 	const exec = makeExecutor();
 	assert.equal(exec.resolve({ command: "echo hi", timeoutMs: 1e9 }).timeoutMs, 6e5);
 	assert.equal(exec.resolve({ command: "echo hi", timeoutMs: 1000 }).timeoutMs, 1000);
 	assert.equal(exec.resolve({ command: "echo hi" }).timeoutMs, 12e4);
+	// Default expiry is 'kill'; the tool passes 'none' for background/promoted work.
+	assert.equal(exec.resolve({ command: "echo hi" }).onExpiry, "kill");
+	assert.equal(exec.resolve({ command: "echo hi", onExpiry: "none" }).onExpiry, "none");
 });
 
 test("resolve: converts an MSYS workdir to a Windows path", () => {
@@ -235,6 +242,11 @@ test("resolve: converts an MSYS workdir to a Windows path", () => {
 test("resolve: a nonexistent workdir throws a clear error", () => {
 	const exec = makeExecutor();
 	assert.throws(() => exec.resolve({ command: "x", workdir: join(tmpdir(), "dsh-gitbash-definitely-missing") }), /workdir does not exist/);
+});
+
+test("executor declares no sandbox mode (msys2 cannot run under the ACL sandbox)", () => {
+	const exec = makeExecutor();
+	assert.equal(exec.sandboxMode, void 0);
 });
 
 test("resolveWorkdir: ~ expands before relative-path resolution (win32)", { skip: process.platform !== "win32" }, () => {
@@ -268,14 +280,15 @@ test("spawnSpec: prepends Git runtime dirs and injects SHELL/HOME", () => {
 	});
 });
 
-test("run: shapes a successful foreground run through the mock subprocess", async () => {
+test("execute: shapes a successful foreground run and its result()", async () => {
 	await withGitRoot(async (gitRoot) => {
 		const spawned = [];
 		const exec = makeExecutor(
 			{ subprocess: { spawn: (spec) => (spawned.push(spec), fakeHandle({ stdout: "hello\n", stderr: "warn\n" })) } },
 			{ bashPath: join(gitRoot, "bin", "bash.exe") }
 		);
-		const result = await exec.run(exec.resolve({ command: "echo hi" }));
+		const proc = await exec.execute(exec.resolve({ command: "echo hi" }));
+		const result = await proc.result();
 		assert.equal(result.exitCode, 0);
 		assert.equal(result.timedOut, false);
 		assert.equal(result.aborted, false);
@@ -286,7 +299,20 @@ test("run: shapes a successful foreground run through the mock subprocess", asyn
 	});
 });
 
-test("run: classifies a BASH_TIMEOUT deadline as timedOut", async () => {
+test("execute: result() is memoized, so repeated foreground reads are stable", async () => {
+	await withGitRoot(async (gitRoot) => {
+		const exec = makeExecutor(
+			{ subprocess: { spawn: () => fakeHandle({ stdout: "once\n" }) } },
+			{ bashPath: join(gitRoot, "bin", "bash.exe") }
+		);
+		const proc = await exec.execute(exec.resolve({ command: "echo once" }));
+		const first = await proc.result();
+		const second = await proc.result();
+		assert.equal(first, second, "the same settled result object is reused");
+	});
+});
+
+test("execute: classifies a BASH_TIMEOUT deadline as timedOut", async () => {
 	await withGitRoot(async (gitRoot) => {
 		const controller = new AbortController();
 		controller.abort(new TimeoutReason("BASH_TIMEOUT", 50));
@@ -294,13 +320,14 @@ test("run: classifies a BASH_TIMEOUT deadline as timedOut", async () => {
 			{ subprocess: { spawn: () => fakeHandle({ stdout: "" }) } },
 			{ bashPath: join(gitRoot, "bin", "bash.exe") }
 		);
-		const result = await exec.run(exec.resolve({ command: "sleep 100", signal: controller.signal }));
+		const proc = await exec.execute(exec.resolve({ command: "sleep 100", signal: controller.signal }));
+		const result = await proc.result();
 		assert.equal(result.timedOut, true);
 		assert.equal(result.aborted, false);
 	});
 });
 
-test("run: classifies a plain cancellation as aborted", async () => {
+test("execute: classifies a plain cancellation as aborted", async () => {
 	await withGitRoot(async (gitRoot) => {
 		const controller = new AbortController();
 		controller.abort(new Error("user cancelled"));
@@ -308,13 +335,74 @@ test("run: classifies a plain cancellation as aborted", async () => {
 			{ subprocess: { spawn: () => fakeHandle() } },
 			{ bashPath: join(gitRoot, "bin", "bash.exe") }
 		);
-		const result = await exec.run(exec.resolve({ command: "anything", signal: controller.signal }));
+		const proc = await exec.execute(exec.resolve({ command: "anything", signal: controller.signal }));
+		const result = await proc.result();
 		assert.equal(result.timedOut, false);
 		assert.equal(result.aborted, true);
 	});
 });
 
-test("start: kill terminates the running process exactly once", async () => {
+test("execute: onExpiry 'none' arms no deadline, so a slow command is not killed", async () => {
+	await withGitRoot(async (gitRoot) => {
+		const exec = makeExecutor(
+			{ subprocess: { spawn: () => fakeHandle({ stdout: "slow\n" }) } },
+			{ bashPath: join(gitRoot, "bin", "bash.exe") }
+		);
+		// A tiny timeoutMs is echoed into the result but never enforced.
+		const spec = exec.resolve({ command: "sleep 100", timeoutMs: 1, onExpiry: "none" });
+		const proc = await exec.execute(spec);
+		const result = await proc.result();
+		assert.equal(result.timedOut, false);
+		assert.equal(result.exitCode, 0);
+		assert.equal(result.stdout.text, "slow\n");
+	});
+});
+
+test("observed: non-consuming readers expose output without draining readOutput()", async () => {
+	await withGitRoot(async (gitRoot) => {
+		// A reader that records how far it was asked to read, so a consuming
+		// implementation (which advances its own offset) is distinguishable.
+		const makeCountingReader = (text) => {
+			const offsets = [];
+			return {
+				offsets,
+				readFrom: (fromByte) => {
+					offsets.push(fromByte);
+					return { text: text.slice(fromByte), lossy: false, nextOffset: text.length };
+				}
+			};
+		};
+		const stdout = makeCountingReader("observed-out\n");
+		const stderr = makeCountingReader("observed-err\n");
+		const exec = makeExecutor(
+			{
+				subprocess: {
+					spawn: () => ({
+						done: Promise.resolve({ exitCode: 0, signal: null }),
+						collected: { stdout, stderr },
+						terminate() {}
+					})
+				}
+			},
+			{ bashPath: join(gitRoot, "bin", "bash.exe") }
+		);
+		const proc = await exec.execute(exec.resolve({ command: "echo hi" }));
+		await proc.done;
+
+		// The registry pump reads at absolute offsets from 0 and must not steal
+		// bytes from the model's consuming cursor.
+		assert.equal(proc.observed.stdout.readFrom(0).text, "observed-out\n");
+		assert.equal(proc.observed.stderr.readFrom(0).text, "observed-err\n");
+		assert.deepEqual(stdout.offsets, [0], "observed read asked at offset 0 only");
+
+		// The consuming read still returns the whole stream: nothing was stolen.
+		const read = proc.readOutput();
+		assert.match(read.delta, /observed-out/);
+		assert.match(read.delta, /\[stderr\]\nobserved-err/);
+	});
+});
+
+test("kill: terminates the running process exactly once", async () => {
 	await withGitRoot(async (gitRoot) => {
 		let terminated = 0;
 		const exec = makeExecutor(
@@ -329,7 +417,7 @@ test("start: kill terminates the running process exactly once", async () => {
 			},
 			{ bashPath: join(gitRoot, "bin", "bash.exe") }
 		);
-		const proc = exec.start(exec.resolve({ command: "sleep 100" }));
+		const proc = await exec.execute(exec.resolve({ command: "sleep 100", onExpiry: "none" }));
 		assert.equal(proc.status, "running");
 		assert.equal(proc.kill(), true);
 		assert.equal(terminated, 1);
@@ -339,7 +427,7 @@ test("start: kill terminates the running process exactly once", async () => {
 	});
 });
 
-test("start: a spawn failure surfaces as the failed status, not killed", async () => {
+test("a provider rejection settles the handle as killed and carries the note on the read path", async () => {
 	await withGitRoot(async (gitRoot) => {
 		const exec = makeExecutor(
 			{
@@ -353,28 +441,267 @@ test("start: a spawn failure surfaces as the failed status, not killed", async (
 			},
 			{ bashPath: join(gitRoot, "bin", "bash.exe") }
 		);
-		const proc = exec.start(exec.resolve({ command: "nope" }));
+		const proc = await exec.execute(exec.resolve({ command: "nope", onExpiry: "none" }));
 		await proc.done;
-		assert.equal(proc.status, "failed");
-		assert.match(proc.spawnError, /ENOENT/);
+		// The seam contract: a rejected provider settles as `killed`, and the
+		// failure text reaches the model through the stderr read path.
+		assert.equal(proc.status, "killed");
 		const read = proc.readOutput();
-		assert.match(read.delta, /spawn failed: Error: ENOENT/);
+		assert.match(read.delta, /subprocess failed before reporting an outcome: Error: ENOENT/);
+		// The observed stderr reader serves the same note to the registry pump.
+		assert.match(proc.observed.stderr.readFrom(0).text, /subprocess failed before reporting an outcome/);
+		// ...while result() is the infrastructure-failure channel.
+		await assert.rejects(() => proc.result(), /ENOENT/);
 	});
+});
+
+test("execute: a synchronous spawn failure still yields a handle whose result() rejects", async () => {
+	await withGitRoot(async (gitRoot) => {
+		const exec = makeExecutor(
+			{
+				subprocess: {
+					spawn: () => {
+						throw new Error("spawn EINVAL");
+					}
+				}
+			},
+			{ bashPath: join(gitRoot, "bin", "bash.exe") }
+		);
+		const proc = await exec.execute(exec.resolve({ command: "nope", onExpiry: "none" }));
+		await proc.done;
+		assert.equal(proc.status, "killed");
+		await assert.rejects(() => proc.result(), /spawn EINVAL/);
+	});
+});
+
+/**
+ * Mount the model-facing tool on a mock context and return its registered
+ * definition, so `execute` can be driven directly.
+ *
+ * The `jobs` stub mirrors the real registry's contract closely enough to
+ * catch the two integration mistakes a hand-written copy made before:
+ * - `owner` is the session **id** (`@deepseek-ai/dsh-jobs-local` resolves it
+ *   through `agents.get(session)`), so passing the Agent object misses the
+ *   lookup and the real registry throws
+ *   `session "[object Object]" has no live agent`.
+ * - output reaches the model only through the spec's `output` pull sources,
+ *   which the registry pumps; the old `readOutput()` hook is ignored.
+ *
+ * `wait` reports the job as still running until `settle` is called, which is
+ * what drives the promote-on-timeout path.
+ */
+function mountTool({ agents = {}, jobs = true, execute, wait } = {}, config = {}) {
+	let registered;
+	const started = [];
+	const reads = [];
+	const removed = [];
+	const killed = [];
+	const chunks = [];
+	const jobView = (id) => ({
+		id,
+		status: "running",
+		detail: void 0,
+		output: { spillPaths: [] }
+	});
+	const stub = {
+		start(spec) {
+			if (spec.owner !== void 0 && agents[spec.owner] === void 0) {
+				throw new Error(`session "${spec.owner}" has no live agent (background job owner must be live)`);
+			}
+			started.push(spec);
+			spec.run();
+			return "bash-1";
+		},
+		read(id) {
+			reads.push(id);
+			return { chunks, lossy: false, job: jobView(id) };
+		},
+		async wait(id) {
+			if (wait !== void 0) return wait();
+			return { ...jobView(id), status: "completed" };
+		},
+		kill(id, owner, reason) {
+			killed.push({ id, owner, reason });
+		},
+		remove(id) {
+			removed.push(id);
+		}
+	};
+	const ctx = {
+		tools: {
+			register(definition) {
+				registered = definition;
+				return () => {};
+			}
+		},
+		systemPrompt: { section() {} },
+		logger: { warn() {} },
+		shellEnv: { collect: () => ({}) },
+		fiber: { state: 1 },
+		gitbash: {
+			sandboxMode: void 0,
+			resolve: (request) => ({ command: request.command, workdir: request.workdir ?? process.cwd(), timeoutMs: request.timeoutMs ?? 12e4, onExpiry: request.onExpiry ?? "kill", stdoutMaxBytes: 64e3, ...request }),
+			execute:
+				execute ??
+				(async (spec) => ({
+					status: "completed",
+					exitCode: 0,
+					signal: null,
+					observed: {
+						stdout: { readFrom: () => ({ text: "", nextOffset: 0, lossy: false }) },
+						stderr: { readFrom: () => ({ text: "", nextOffset: 0, lossy: false }) }
+					},
+					done: Promise.resolve(),
+					readOutput: () => ({ delta: "", lossy: false }),
+					kill: () => true,
+					result: async () => ({ exitCode: 0, signal: null, timedOut: false, aborted: false, timeoutMs: spec.timeoutMs, stdout: { text: "fg-out\n", truncated: false }, stderr: { text: "", truncated: false } })
+				}))
+		},
+		get(service) {
+			return service === "jobs" ? (jobs ? stub : void 0) : void 0;
+		},
+		inject(_services, callback) {
+			// Mirror the host: the jobs-aware registration only happens once the
+			// service is present.
+			if (jobs) callback({ jobs: stub, effect: () => () => {} });
+		}
+	};
+	tool.apply(ctx, config);
+	return { definition: registered, started, reads, removed, killed, chunks };
+}
+
+test("background: the job is registered with the owner's session id, not the Agent object", async () => {
+	const agent = { id: "session-abc", session: { header: { cwd: process.cwd() } } };
+	const { definition, started } = mountTool({ agents: { "session-abc": agent } });
+	const value = await definition.execute({ command: "sleep 100", description: "Sleep for a while", run_in_background: true }, { agent, signal: new AbortController().signal });
+	assert.equal(value.kind, "background");
+	assert.equal(value.jobId, "bash-1");
+	assert.equal(started.length, 1);
+	// The regression: the owner must be the id string, so the registry's
+	// `agents.get(session)` lookup hits. An Agent object fails that lookup.
+	assert.equal(started[0].owner, "session-abc");
+});
+
+test("background: the job declares pull sources, so output reaches the registry ring", async () => {
+	const { definition, started } = mountTool();
+	await definition.execute({ command: "echo hi", description: "Echo", run_in_background: true }, { signal: new AbortController().signal });
+	// The regression: without `output` the registry has nothing to pump, so a
+	// finished job reads as empty forever.
+	assert.ok(Array.isArray(started[0].output), "spec.output is an array of pull sources");
+	assert.deepEqual(started[0].output.map((s) => s.channel), ["stdout", "stderr"]);
+	assert.equal(typeof started[0].output[0].read, "function");
+	// A read before the process exists yields nothing (never throws).
+	assert.deepEqual(started[0].output[0].read(0), { text: "", nextOffset: 0, lossy: false });
+});
+
+test("background: a pull source reads the process's observed streams by absolute offset", async () => {
+	let observedFrom;
+	const fakeProc = {
+		status: "completed",
+		exitCode: 0,
+		signal: null,
+		observed: {
+			stdout: {
+				readFrom: (from) => {
+					observedFrom = from;
+					return { text: "job-out\n", nextOffset: from + 8, lossy: false };
+				}
+			},
+			stderr: { readFrom: (from) => ({ text: "", nextOffset: from, lossy: false }) }
+		},
+		done: Promise.resolve(),
+		readOutput: () => ({ delta: "", lossy: false }),
+		kill: () => true,
+		result: async () => ({ exitCode: 0, signal: null, timedOut: false, aborted: false, timeoutMs: 12e4, stdout: { text: "job-out\n", truncated: false }, stderr: { text: "", truncated: false } })
+	};
+	const { definition, started } = mountTool({ execute: async () => fakeProc });
+	await definition.execute({ command: "echo hi", description: "Echo", run_in_background: true }, { signal: new AbortController().signal });
+	// The starter spawned the process during registry.start -> spec.run().
+	const source = started[0].output[0];
+	assert.equal(source.read(0).text, "job-out\n");
+	assert.equal(observedFrom, 0, "the registry reads at its own absolute offset");
+	assert.equal(source.read(8).text, "job-out\n", "non-consuming: a later offset is passed through untouched");
+});
+
+test("background: an unowned call still starts without an owner", async () => {
+	const { definition, started } = mountTool();
+	const value = await definition.execute({ command: "sleep 1", description: "Sleep briefly", run_in_background: true }, { signal: new AbortController().signal });
+	assert.equal(value.kind, "background");
+	assert.equal(started[0].owner, void 0);
+});
+
+test("background: run_in_background is rejected when disabled by config", async () => {
+	const { definition } = mountTool({}, { enableRunInBackground: false });
+	await assert.rejects(
+		() => definition.execute({ command: "sleep 1", description: "Sleep briefly", run_in_background: true }, { signal: new AbortController().signal }),
+		/run_in_background is disabled/
+	);
+});
+
+test("background: a missing jobs service names the packages to load", async () => {
+	const { definition } = mountTool({ jobs: false });
+	await assert.rejects(
+		() => definition.execute({ command: "sleep 1", description: "Sleep briefly", run_in_background: true }, { signal: new AbortController().signal }),
+		/load @deepseek-ai\/dsh-jobs and @deepseek-ai\/dsh-tool-jobs/
+	);
+});
+
+test("promote: a foreground call that outlives its wait returns kind 'promoted' with the job id", async () => {
+	// The registry reports the job as still running, which is exactly the
+	// promote path: the call stops waiting without killing the command.
+	const { definition, reads, killed, removed } = mountTool({
+		wait: async () => ({ id: "bash-1", status: "running", detail: void 0, output: { spillPaths: [] } })
+	});
+	const value = await definition.execute({ command: "sleep 100", description: "Sleep", timeoutMs: 10 }, { signal: new AbortController().signal });
+	assert.equal(value.kind, "promoted");
+	assert.equal(value.jobId, "bash-1");
+	assert.equal(value.timeoutMs, 10);
+	assert.equal(typeof value.output, "string");
+	assert.equal(reads.length, 1, "the promoted result embeds one consuming ring read");
+	assert.equal(killed.length, 0, "a promoted command keeps running");
+	assert.equal(removed.length, 0, "its record stays with the job, not the call");
+});
+
+test("promote: the promoted text carries the still-running marker and the hand-off", async () => {
+	const { definition, chunks } = mountTool({
+		wait: async () => ({ id: "bash-1", status: "running", detail: void 0, output: { spillPaths: [] } })
+	});
+	chunks.push({ channel: "stdout", text: "partial output\n" });
+	const value = await definition.execute({ command: "sleep 100", description: "Sleep", timeoutMs: 10 }, { signal: new AbortController().signal });
+	const text = definition.output.render(void 0, value)[0].text;
+	assert.match(text, /partial output/);
+	assert.match(text, /\[still running after 10ms; moved to background job bash-1\]/);
+	assert.match(text, /read newer output with job_output/);
+});
+
+test("promote: a settled foreground call removes the record and returns kind 'foreground'", async () => {
+	const { definition, removed } = mountTool();
+	const value = await definition.execute({ command: "echo hi", description: "Echo" }, { signal: new AbortController().signal });
+	assert.equal(value.kind, "foreground");
+	assert.equal(value.exitCode, 0);
+	assert.deepEqual(removed, ["bash-1"], "a collected foreground record leaves with the call");
+});
+
+test("the timeoutMs description advertises promotion when it is enabled", () => {
+	// `defineTool` converts the parameter spec into JSON Schema, so the
+	// description lives under `properties`.
+	const descriptionOf = (definition) => definition.parameters.properties.timeoutMs.description;
+	const promoted = mountTool().definition;
+	const killed = mountTool({}, { promoteOnTimeout: false }).definition;
+	assert.match(descriptionOf(promoted), /moves to the background as a job/);
+	assert.match(descriptionOf(killed), /kills the command on expiry/);
 });
 
 test("real Git Bash spawn (skipped when no installation detected)", { skip: !findGitBash(void 0) }, async () => {
 	const bash = findGitBash(void 0);
 	await new Promise((resolvePromise, reject) => {
-		const child = spawn(bash, ["-c", "echo gitbash-smoke-ok && git --version"], { stdio: ["ignore", "pipe", "pipe"] });
+		const child = spawn(bash, ["-c", "echo gitbash-smoke-ok"], { stdio: ["ignore", "pipe", "pipe"] });
 		let out = "";
-		let err = "";
 		child.stdout.on("data", (d) => (out += d));
-		child.stderr.on("data", (d) => (err += d));
 		child.on("close", (code) => {
 			try {
-				assert.equal(code, 0, `bash exited ${code}: ${err}`);
+				assert.equal(code, 0, `bash exited ${code}`);
 				assert.match(out, /gitbash-smoke-ok/);
-				assert.match(out, /git version/);
 				resolvePromise();
 			} catch (error) {
 				reject(error);
@@ -401,4 +728,49 @@ test("real Git Bash runs git coreutils through the injected PATH (skipped when n
 			}
 		});
 	});
+});
+
+test("real Git Bash executor: a background process exposes observed output to the pump", { skip: !findGitBash(void 0) }, async () => {
+	const bash = findGitBash(void 0);
+	const dir = mkdtempSync(join(tmpdir(), "dsh-gitbash-real-"));
+	try {
+		// A real subprocess service stand-in: collect both streams, expose the
+		// same `collected` readers the host subprocess seam returns.
+		const exec = makeExecutor(
+			{
+				subprocess: {
+					spawn: (spec) => {
+						const child = spawn(spec.argv[0], spec.argv.slice(1), {
+							cwd: spec.cwd,
+							env: { ...process.env, ...spec.env },
+							stdio: ["ignore", "pipe", "pipe"]
+						});
+						let out = "";
+						let err = "";
+						child.stdout.on("data", (d) => (out += d));
+						child.stderr.on("data", (d) => (err += d));
+						const reader = (get) => ({ readFrom: (from) => ({ text: get().slice(from), lossy: false, nextOffset: get().length }) });
+						return {
+							done: new Promise((r) => child.on("close", (code) => r({ exitCode: code, signal: null }))),
+							collected: { stdout: reader(() => out), stderr: reader(() => err) },
+							terminate: () => child.kill()
+						};
+					}
+				}
+			},
+			{ bashPath: bash }
+		);
+		const proc = await exec.execute(exec.resolve({ command: "echo real-observed-ok", onExpiry: "none" }));
+		await proc.done;
+		assert.equal(proc.exitCode, 0);
+		// The registry pump path: non-consuming read of what the process wrote.
+		assert.match(proc.observed.stdout.readFrom(0).text, /real-observed-ok/);
+		// The consuming path still sees it too.
+		assert.match(proc.readOutput().delta, /real-observed-ok/);
+		const result = await proc.result();
+		assert.equal(result.exitCode, 0);
+		assert.match(result.stdout.text, /real-observed-ok/);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
 });

@@ -106,10 +106,24 @@ dsh plugin --profile web add link:./dsh-gitbash
 ```
 
 > The bundle imports `@deepseek-ai/*` packages and declares them in
-> `peerDependencies`/`devDependencies` at the harness versions it was built
-> against. Peer ranges are pinned exactly (`0.1.7-rc.2`), so the harness
-> compatibility check has nothing to complain about, and `pnpm install` in a
-> checkout gives you the matching seam definitions for editing.
+> `peerDependencies`/`devDependencies`. `devDependencies` pin the exact harness
+> version the tests run against; `peerDependencies` use the RANGE
+> `>=0.1.7-rc.2 <0.3.0-0` rather than an exact pin.
+>
+> **Why a range, not an exact pin.** The harness skips any bundle whose
+> `@deepseek-ai/dsh-*` peers do not admit the running runtime — the plugin
+> simply does not load, and its tools silently disappear. An exact pin turns
+> every runtime release into an outage: when the Desktop app auto-updated from
+> `0.1.7-rc.2` to `0.2.0-rc.1`, this bundle was skipped and the `bash` tool
+> vanished. The seam contracts had not changed at all (verified: every file of
+> `dsh-shell`, `dsh-jobs`, and `dsh-tools` is byte-identical across those two
+> versions, and all 43 tests pass against `0.2.0-rc.1`), so the block was
+> purely the version string.
+>
+> The upper bound stays `<0.3.0-0` so a genuinely breaking runtime line still
+> fails closed instead of loading into an unknown contract. When a real break
+> happens, re-port from the shipped tool as described above rather than
+> widening the range.
 >
 > A `link:` install resolves `@deepseek-ai/*` from the checkout's own
 > `node_modules`, which is why they must be installed there rather than
